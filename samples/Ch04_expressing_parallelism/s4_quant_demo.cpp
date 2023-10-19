@@ -265,9 +265,13 @@ void gpu_dequant_s4fullrange_f32_KxN(queue &q, buffer<int8_t, 2> &src, buffer<fl
                  range local{LOCAL_K, LOCAL_N};
                  h.parallel_for(nd_range{global,local},[=](nd_item<2> it){
 int i=it.get_global_id(0)+k_pos;
-int j=it.get_global_id(1)+n_pos;
-if(i<k&&j<n){
-fp32_wei[i][j]=s4_wei[i][j]*s[i/blksize*n+j];
+int j=it.get_global_id(1)/2+n_pos;
+if(i<k&&j+1<n){
+    float thread_scale=s[i/blksize*n+j];
+    int8_t s8_l=s4_wei[i][j]&0x0f;
+    int8_t s8_h=(s4_wei[i][j]>>4)&0x0f;
+fp32_wei[i][j]=(s8_l-8)*s[i/blksize*n+j];
+fp32_wei[i][j+1]=(s8_h-8)*s[i/blksize*n+j+1];
 }
                  }); });
 }
@@ -330,24 +334,35 @@ int main()
 
     buffer<float, 2> dst_buf(dq_wei.data(), range<2>(K, N));
     buffer<float, 1> scale_buf(scale, range<1>(K / blksize * N));
-    buffer<int8_t, 2> src_buf(s8_wei.data(), range<2>(K, N));
+    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(raw_wei), range<2>(K, N));
     queue q;
 
     constexpr int KTILE = 4, NTILE = 4;
     constexpr int LOCAL_K = 2, LOCAL_N = 2;
     static_assert(KTILE % LOCAL_K == 0);
-    static_assert(NTILE % LOCAL_N == 0);
+    static_assert((NTILE / 2) % LOCAL_N == 0);
     for (int i = 0; i < K; i += KTILE)
     {
         for (int j = 0; j < N; j += NTILE)
         {
-            gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, K, N, blksize, i, j);
+            gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, K, N, blksize, i, j);
         }
     }
     q.wait();
     std::cout << "GPU dequant" << std::endl;
     host_accessor hs(dst_buf);
     dump_matrix(hs.get_pointer(), K, N);
+    bool ok = true;
+    for (int i = 0; i < dq_wei.size(); i++)
+    {
+        if (dq_wei[i] != hs.get_pointer()[i])
+            ok = false;
+    }
+    if (ok)
+        std::cout << "ok" << std::endl;
+    else
+        std::cout << "fail" << std::endl;
+
     free(s4_wei);
     return 0;
 }
