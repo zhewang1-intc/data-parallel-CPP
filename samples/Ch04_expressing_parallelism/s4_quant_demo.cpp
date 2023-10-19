@@ -1,5 +1,5 @@
-// #include <sycl/sycl.hpp>
-// using namespace sycl;
+#include <sycl/sycl.hpp>
+using namespace sycl;
 
 #include <iostream>
 #include <cstring>
@@ -253,6 +253,23 @@ void decompress_kblock_s8_f32(int8_t *srcptr, _DST_T *dstptr, int row, int col, 
     }
 }
 
+template <int TILE_K, int TILE_N, int LOCAL_K, int LOCAL_N>
+void gpu_dequant_s4fullrange_f32_KxN(queue &q, buffer<int8_t, 2> &src, buffer<float, 2> &dst, buffer<float, 1> &scale, int k, int n, int k_pos, int n_pos)
+{
+    q.submit([&](handler &h)
+             {
+                 accessor s4_wei{src, h};
+                 accessor fp32_wei{dst, h};
+                 accessor s{scale, h};
+                 range global{TILE_K, TILE_N};
+                 range local{LOCAL_K, LOCAL_N};
+                 h.parallel_for(nd_range{global,local},[=](nd_item<2> it){
+int j=it.get_global_id(0);
+int i=it.get_global_id(1);
+fp32_wei[i][j]=i+j;
+                 }); });
+}
+
 std::vector<float> dequantize(void *s4_wei, int k, int n, int blksize, bool transpose, std::string weight_type, std::string cmpt_type)
 {
     assert(!transpose);
@@ -300,19 +317,18 @@ int main()
     std::cout << "================" << std::endl;
     auto dq_wei = dequantize(s4_wei, K, N, blksize, false, "s4fullrange_scalef32", "fp32");
     dump_matrix(dq_wei.data(), K, N);
+
+    buffer<float, 2> dst_buf(dq_wei.data(), range<2>(K, N));
+    buffer<float, 1> scale_buf(reinterpret_cast<float *>(s4_wei), range<1>(K / blksize * N));
+    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(s4_wei), range<2>(K, N));
+    queue q;
+
+    gpu_dequant_s4fullrange_f32_KxN<16, 16, 4, 4>(q, src_buf, dst_buf, scale_buf, 16, 16, 0, 0);
+
+    q.wait();
+
+    host_accessor hs(dst_buf);
+    dump_matrix(hs.get_pointer(), K, N);
     free(s4_wei);
-    // CompressWei4Bit obj(K, N, blksize, sym);
-
-    // // 分配内存
-    // void *buf = malloc(obj.get_serialize_size());
-
-    // // 序列化
-    // obj.serialize(buf);
-
-    // // 反序列化
-    // obj.deserialize(buf);
-
-    // free(buf);
-
     return 0;
 }
