@@ -275,6 +275,26 @@ fp32_wei[i][fp32_j+1]=(s8_h-8)*s[i/blksize*n+fp32_j+1];
                  }); });
 }
 
+template <int TILE_K, int TILE_N, int LOCAL_K, int LOCAL_N>
+void gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, float *dst, float *scale, int k, int n, int blksize, int k_pos, int n_pos)
+{
+    q.submit([&](handler &h)
+             {
+                 range global{TILE_K, TILE_N};
+                 range local{LOCAL_K, LOCAL_N};
+                 h.parallel_for(nd_range{global,local},[=](nd_item<2> it){
+int i=it.get_global_id(0)+k_pos;
+int s4_j=it.get_global_id(1)+n_pos/2;
+int fp32_j=s4_j*2;
+if(i<k&&fp32_j+1<n){
+    int8_t s8_l=src[i*n/2+s4_j]&0x0f;
+    int8_t s8_h=(src[i*n/2+s4_j]>>4)&0x0f;
+dst[i*n+fp32_j]=(s8_l-8)*scale[i/blksize*n+fp32_j];
+dst[i*n+fp32_j+1]=(s8_h-8)*scale[i/blksize*n+fp32_j+1];
+}
+                 }); });
+}
+
 void dequantize(CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
 {
     using namespace std::chrono;
@@ -298,10 +318,9 @@ void dequantize(CompressWei4Bit *compress_wei, float *dequant_weight, bool trans
     std::cout << "CPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
 }
 
-void gpu_dequant(CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
+void gpu_dequant(queue &q, CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
 {
 
-    queue q;
     int8_t *bit4_wei = reinterpret_cast<int8_t *>(compress_wei->get_4bit_wei_ptr());
     float *scale = reinterpret_cast<float *>(compress_wei->get_scale_ptr());
     buffer<float, 2> dst_buf(dequant_weight, range<2>(compress_wei->_K, compress_wei->_N));
@@ -316,6 +335,26 @@ void gpu_dequant(CompressWei4Bit *compress_wei, float *dequant_weight, bool tran
         for (int j = 0; j < compress_wei->_N; j += NTILE)
         {
             gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, compress_wei->_K, compress_wei->_N, compress_wei->_blksize, i, j);
+        }
+    }
+    q.wait();
+    auto m_end = high_resolution_clock::now();
+    std::cout << "GPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
+    return;
+}
+
+// device mem impl
+void gpu_dequant(queue &q, int8_t *src, float *dst, float *scale, int k, int n, int blksize)
+{
+    constexpr int KTILE = 1024, NTILE = 1024;
+    constexpr int LOCAL_K = 32, LOCAL_N = 32;
+    using namespace std::chrono;
+    auto m_start = high_resolution_clock::now();
+    for (int i = 0; i < k; i += KTILE)
+    {
+        for (int j = 0; j < n; j += NTILE)
+        {
+            gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src, dst, scale, k, n, blksize, i, j);
         }
     }
     q.wait();
@@ -347,12 +386,28 @@ void ut(int K, int N, int blksize)
     void *s4_wei = quantize(f32wei.data(), K, N, blksize, false, "s4fullrange_scalef32", "fp32");
     std::vector<float> gpu_dq(K * N);
     std::vector<float> cpu_dq(K * N);
+    queue q;
 
     CompressWei4Bit obj(K, N, blksize, false);
     obj.deserialize(s4_wei);
 
     dequantize(&obj, cpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
-    gpu_dequant(&obj, gpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
+    int8_t *dev_src = malloc_device<int8_t>(K * N / 2, q);
+    float *dev_scale = malloc_device<float>(K / blksize * N, q);
+    float *dev_dst = malloc_device<float>(K * N, q);
+
+    q.submit([&](handler &h)
+             { h.memcpy(dev_src, obj.get_4bit_wei_ptr(), K * N / 2); });
+    q.submit([&](handler &h)
+             { h.memcpy(dev_scale, obj.get_scale_ptr(), K / blksize * N * sizeof(float)); });
+    q.wait();
+
+    // gpu_dequant(q, &obj, gpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
+    gpu_dequant(q, dev_src, dev_dst, dev_scale, K, N, blksize);
+
+    q.submit([&](handler &h)
+             { h.memcpy(gpu_dq.data(), dev_dst, K * N * sizeof(float)); });
+    q.wait();
 
     bool ok = true;
     for (int i = 0; i < cpu_dq.size(); i++)
@@ -373,7 +428,7 @@ int main()
 
     ut(1024, 1024, 8);
     ut(1020, 1024, 30);
-    ut(8192, 4096, 32);
+    ut(11008, 4096, 32);
 
     return 0;
 }
