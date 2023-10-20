@@ -265,13 +265,13 @@ void gpu_dequant_s4fullrange_f32_KxN(queue &q, buffer<int8_t, 2> &src, buffer<fl
                  range local{LOCAL_K, LOCAL_N};
                  h.parallel_for(nd_range{global,local},[=](nd_item<2> it){
 int i=it.get_global_id(0)+k_pos;
-int j=it.get_global_id(1)/2+n_pos;
-if(i<k&&j+1<n){
-    float thread_scale=s[i/blksize*n+j];
-    int8_t s8_l=s4_wei[i][j]&0x0f;
-    int8_t s8_h=(s4_wei[i][j]>>4)&0x0f;
-fp32_wei[i][j]=(s8_l-8)*s[i/blksize*n+j];
-fp32_wei[i][j+1]=(s8_h-8)*s[i/blksize*n+j+1];
+int s4_j=it.get_global_id(1)+n_pos/2;
+int fp32_j=s4_j*2;
+if(i<k&&fp32_j+1<n){
+    int8_t s8_l=s4_wei[i][s4_j]&0x0f;
+    int8_t s8_h=(s4_wei[i][s4_j]>>4)&0x0f;
+fp32_wei[i][fp32_j]=(s8_l-8)*s[i/blksize*n+fp32_j];
+fp32_wei[i][fp32_j+1]=(s8_h-8)*s[i/blksize*n+fp32_j+1];
 }
                  }); });
 }
@@ -309,21 +309,23 @@ void dump_matrix(float *mat, int k, int n)
     }
 }
 
+
+
+
 int main()
 {
-    int K = 16;
-    int N = 20;
-    int blksize = 4;
+    int K = 1024;
+    int N = 1024;
+    int blksize = 32;
     bool sym = false;
     std::vector<float> f32wei(K * N);
     for (int i = 0; i < K * N; i++)
         f32wei[i] = randn() * 10;
     std::cout << "raw weight" << std::endl;
-    dump_matrix(f32wei.data(), K, N);
     void *s4_wei = quantize(f32wei.data(), K, N, blksize, false, "s4fullrange_scalef32", "fp32");
     std::cout << "CPU dequant" << std::endl;
     auto dq_wei = dequantize(s4_wei, K, N, blksize, false, "s4fullrange_scalef32", "fp32");
-    dump_matrix(dq_wei.data(), K, N);
+    // dump_matrix(dq_wei.data(), K, N);
 
     CompressWei4Bit obj(K, N, blksize, false);
     obj.deserialize(s4_wei);
@@ -331,14 +333,17 @@ int main()
     int4x2 *raw_wei = reinterpret_cast<int4x2 *>(obj.get_4bit_wei_ptr());
     float *scale = reinterpret_cast<float *>(obj.get_scale_ptr());
     decompress_s4_s8<S4_FULLRANGE>(raw_wei, s8_wei.data(), K, N, N, N);
+    std::vector<float> gpu_dq(K * N);
 
-    buffer<float, 2> dst_buf(dq_wei.data(), range<2>(K, N));
+
+
+    buffer<float, 2> dst_buf(gpu_dq.data(), range<2>(K, N));
     buffer<float, 1> scale_buf(scale, range<1>(K / blksize * N));
-    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(raw_wei), range<2>(K, N));
+    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(raw_wei), range<2>(K, N/2));
     queue q;
 
-    constexpr int KTILE = 4, NTILE = 4;
-    constexpr int LOCAL_K = 2, LOCAL_N = 2;
+    constexpr int KTILE = 256, NTILE = 256;
+    constexpr int LOCAL_K = 8, LOCAL_N = 8;
     static_assert(KTILE % LOCAL_K == 0);
     static_assert((NTILE / 2) % LOCAL_N == 0);
     for (int i = 0; i < K; i += KTILE)
@@ -351,7 +356,7 @@ int main()
     q.wait();
     std::cout << "GPU dequant" << std::endl;
     host_accessor hs(dst_buf);
-    dump_matrix(hs.get_pointer(), K, N);
+    // dump_matrix(hs.get_pointer(), K, N);
     bool ok = true;
     for (int i = 0; i < dq_wei.size(); i++)
     {
