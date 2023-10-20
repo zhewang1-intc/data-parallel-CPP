@@ -6,6 +6,7 @@ using namespace sycl;
 #include <assert.h>
 #include <vector>
 #include <math.h>
+#include <chrono>
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 inline float randn(float _off = -1.f)
@@ -85,11 +86,6 @@ public:
         return get_meta_data_size() + get_buf_size();
     }
 
-    size_t get_meta_data_size()
-    {
-        return sizeof(_N) + sizeof(_K) + sizeof(_blksize) + sizeof(_sym);
-    }
-
     void *get_4bit_wei_ptr()
     {
         return _write_buf;
@@ -99,6 +95,7 @@ public:
     {
         return _write_buf + get_4bit_wei_size();
     }
+    int _N, _K, _blksize;
 
 private:
     size_t get_4bit_wei_size()
@@ -118,8 +115,10 @@ private:
 
         return get_4bit_wei_size() + get_scale_size() + get_zp_size();
     }
-
-    int _N, _K, _blksize;
+    size_t get_meta_data_size()
+    {
+        return sizeof(_N) + sizeof(_K) + sizeof(_blksize) + sizeof(_sym);
+    }
     bool _sym;
     char *_write_buf;
 };
@@ -273,11 +272,15 @@ if(i<k&&fp32_j+1<n){
 fp32_wei[i][fp32_j]=(s8_l-8)*s[i/blksize*n+fp32_j];
 fp32_wei[i][fp32_j+1]=(s8_h-8)*s[i/blksize*n+fp32_j+1];
 }
-                 }); });
+                 }); 
+                 });
+                 return;
 }
 
 std::vector<float> dequantize(void *s4_wei, int k, int n, int blksize, bool transpose, std::string weight_type, std::string cmpt_type)
 {
+    using namespace std::chrono;
+    auto m_start = high_resolution_clock::now();
     assert(!transpose);
     CompressWei4Bit obj(k, n, blksize, false);
     obj.deserialize(s4_wei);
@@ -294,7 +297,36 @@ std::vector<float> dequantize(void *s4_wei, int k, int n, int blksize, bool tran
     {
         assert(0);
     }
+    auto m_end = high_resolution_clock::now();
+    std::cout << "CPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
     return f32_wei;
+}
+
+
+void gpu_dequant(CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
+{
+
+    queue q;
+    int8_t *bit4_wei = reinterpret_cast<int8_t *>(compress_wei->get_4bit_wei_ptr());
+    float *scale = reinterpret_cast<float *>(compress_wei->get_scale_ptr());
+    buffer<float, 2> dst_buf(dequant_weight, range<2>(compress_wei->_K, compress_wei->_N));
+    buffer<float, 1> scale_buf(scale, range<1>(compress_wei->_K / compress_wei->_blksize * compress_wei->_N));
+    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(bit4_wei), range<2>(compress_wei->_K, compress_wei->_N / 2));
+    constexpr int KTILE = 1024, NTILE = 1024;
+    constexpr int LOCAL_K = 32, LOCAL_N = 32;
+    using namespace std::chrono;
+    auto m_start = high_resolution_clock::now();
+    for (int i = 0; i < compress_wei->_K; i += KTILE)
+    {
+        for (int j = 0; j < compress_wei->_N; j += NTILE)
+        {
+    gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, compress_wei->_K, compress_wei->_N, compress_wei->_blksize, i, j);
+        }
+    }
+    q.wait();
+    auto m_end = high_resolution_clock::now();
+    std::cout << "GPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
+    return;
 }
 
 void dump_matrix(float *mat, int k, int n)
@@ -309,58 +341,29 @@ void dump_matrix(float *mat, int k, int n)
     }
 }
 
-
-
-
-int main()
+void ut(int K, int N, int blksize)
 {
-    int K = 1024;
-    int N = 1024;
-    int blksize = 32;
+    std::cout << "K:" << K << " N:" << N << " blksize:" << blksize << std::endl;
+    assert(N % 2 == 0);
     bool sym = false;
     std::vector<float> f32wei(K * N);
     for (int i = 0; i < K * N; i++)
         f32wei[i] = randn() * 10;
-    std::cout << "raw weight" << std::endl;
     void *s4_wei = quantize(f32wei.data(), K, N, blksize, false, "s4fullrange_scalef32", "fp32");
-    std::cout << "CPU dequant" << std::endl;
     auto dq_wei = dequantize(s4_wei, K, N, blksize, false, "s4fullrange_scalef32", "fp32");
-    // dump_matrix(dq_wei.data(), K, N);
 
     CompressWei4Bit obj(K, N, blksize, false);
     obj.deserialize(s4_wei);
-    std::vector<int8_t> s8_wei(K * N);
-    int4x2 *raw_wei = reinterpret_cast<int4x2 *>(obj.get_4bit_wei_ptr());
-    float *scale = reinterpret_cast<float *>(obj.get_scale_ptr());
-    decompress_s4_s8<S4_FULLRANGE>(raw_wei, s8_wei.data(), K, N, N, N);
+
     std::vector<float> gpu_dq(K * N);
 
+    gpu_dequant(&obj, gpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
 
 
-    buffer<float, 2> dst_buf(gpu_dq.data(), range<2>(K, N));
-    buffer<float, 1> scale_buf(scale, range<1>(K / blksize * N));
-    buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(raw_wei), range<2>(K, N/2));
-    queue q;
-
-    constexpr int KTILE = 256, NTILE = 256;
-    constexpr int LOCAL_K = 8, LOCAL_N = 8;
-    static_assert(KTILE % LOCAL_K == 0);
-    static_assert((NTILE / 2) % LOCAL_N == 0);
-    for (int i = 0; i < K; i += KTILE)
-    {
-        for (int j = 0; j < N; j += NTILE)
-        {
-            gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, K, N, blksize, i, j);
-        }
-    }
-    q.wait();
-    std::cout << "GPU dequant" << std::endl;
-    host_accessor hs(dst_buf);
-    // dump_matrix(hs.get_pointer(), K, N);
     bool ok = true;
     for (int i = 0; i < dq_wei.size(); i++)
     {
-        if (dq_wei[i] != hs.get_pointer()[i])
+        if (dq_wei[i] != gpu_dq[i])
             ok = false;
     }
     if (ok)
@@ -369,5 +372,14 @@ int main()
         std::cout << "fail" << std::endl;
 
     free(s4_wei);
+}
+
+int main()
+{
+
+    ut(1024, 1024, 8);
+    ut(1020, 1024, 30);
+    ut(4096, 4096, 32);
+
     return 0;
 }
