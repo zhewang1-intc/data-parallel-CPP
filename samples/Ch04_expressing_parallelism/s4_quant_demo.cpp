@@ -272,26 +272,23 @@ if(i<k&&fp32_j+1<n){
 fp32_wei[i][fp32_j]=(s8_l-8)*s[i/blksize*n+fp32_j];
 fp32_wei[i][fp32_j+1]=(s8_h-8)*s[i/blksize*n+fp32_j+1];
 }
-                 }); 
-                 });
-                 return;
+                 }); });
 }
 
-std::vector<float> dequantize(void *s4_wei, int k, int n, int blksize, bool transpose, std::string weight_type, std::string cmpt_type)
+void dequantize(CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
 {
     using namespace std::chrono;
     auto m_start = high_resolution_clock::now();
     assert(!transpose);
-    CompressWei4Bit obj(k, n, blksize, false);
-    obj.deserialize(s4_wei);
-    std::vector<float> f32_wei(k * n);
+    int n = compress_wei->_N;
+    int k = compress_wei->_K;
     std::vector<int8_t> s8_wei(k * n);
-    int4x2 *raw_wei = reinterpret_cast<int4x2 *>(obj.get_4bit_wei_ptr());
-    float *scale = reinterpret_cast<float *>(obj.get_scale_ptr());
+    int4x2 *raw_wei = reinterpret_cast<int4x2 *>(compress_wei->get_4bit_wei_ptr());
+    float *scale = reinterpret_cast<float *>(compress_wei->get_scale_ptr());
     if (weight_type == "s4fullrange_scalef32")
     {
         decompress_s4_s8<S4_FULLRANGE>(raw_wei, s8_wei.data(), k, n, n, n);
-        decompress_kblock_s8_f32(s8_wei.data(), f32_wei.data(), k, n, n, n, reinterpret_cast<float *>(obj.get_scale_ptr()), nullptr, 0, blksize, n);
+        decompress_kblock_s8_f32(s8_wei.data(), dequant_weight, k, n, n, n, reinterpret_cast<float *>(compress_wei->get_scale_ptr()), nullptr, 0, compress_wei->_blksize, n);
     }
     else
     {
@@ -299,9 +296,7 @@ std::vector<float> dequantize(void *s4_wei, int k, int n, int blksize, bool tran
     }
     auto m_end = high_resolution_clock::now();
     std::cout << "CPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
-    return f32_wei;
 }
-
 
 void gpu_dequant(CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
 {
@@ -320,7 +315,7 @@ void gpu_dequant(CompressWei4Bit *compress_wei, float *dequant_weight, bool tran
     {
         for (int j = 0; j < compress_wei->_N; j += NTILE)
         {
-    gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, compress_wei->_K, compress_wei->_N, compress_wei->_blksize, i, j);
+            gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(q, src_buf, dst_buf, scale_buf, compress_wei->_K, compress_wei->_N, compress_wei->_blksize, i, j);
         }
     }
     q.wait();
@@ -350,20 +345,19 @@ void ut(int K, int N, int blksize)
     for (int i = 0; i < K * N; i++)
         f32wei[i] = randn() * 10;
     void *s4_wei = quantize(f32wei.data(), K, N, blksize, false, "s4fullrange_scalef32", "fp32");
-    auto dq_wei = dequantize(s4_wei, K, N, blksize, false, "s4fullrange_scalef32", "fp32");
+    std::vector<float> gpu_dq(K * N);
+    std::vector<float> cpu_dq(K * N);
 
     CompressWei4Bit obj(K, N, blksize, false);
     obj.deserialize(s4_wei);
 
-    std::vector<float> gpu_dq(K * N);
-
+    dequantize(&obj, cpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
     gpu_dequant(&obj, gpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
 
-
     bool ok = true;
-    for (int i = 0; i < dq_wei.size(); i++)
+    for (int i = 0; i < cpu_dq.size(); i++)
     {
-        if (dq_wei[i] != gpu_dq[i])
+        if (cpu_dq[i] != gpu_dq[i])
             ok = false;
     }
     if (ok)
@@ -379,7 +373,7 @@ int main()
 
     ut(1024, 1024, 8);
     ut(1020, 1024, 30);
-    ut(4096, 4096, 32);
+    ut(8192, 4096, 32);
 
     return 0;
 }
