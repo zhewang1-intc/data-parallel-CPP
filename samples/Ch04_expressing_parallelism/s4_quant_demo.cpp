@@ -275,8 +275,8 @@ fp32_wei[i][fp32_j+1]=(s8_h-8)*s[i/blksize*n+fp32_j+1];
                  }); });
 }
 
-template <int TILE_K, int TILE_N, int LOCAL_K, int LOCAL_N>
-void gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, float *dst, float *scale, int k, int n, int blksize, int k_pos, int n_pos)
+template <int TILE_K, int TILE_N, int LOCAL_K, int LOCAL_N, typename DST_T>
+void gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, DST_T *dst, float *scale, int k, int n, int blksize, int k_pos, int n_pos)
 {
     q.submit([&](handler &h)
              {
@@ -318,12 +318,13 @@ void dequantize(CompressWei4Bit *compress_wei, float *dequant_weight, bool trans
     std::cout << "CPU dequant cost" << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms" << std::endl;
 }
 
-void gpu_dequant(queue &q, CompressWei4Bit *compress_wei, float *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
+template <typename DST_T>
+void gpu_dequant(queue &q, CompressWei4Bit *compress_wei, DST_T *dequant_weight, bool transpose, const std::string &compute_type, const std::string &weight_type)
 {
 
     int8_t *bit4_wei = reinterpret_cast<int8_t *>(compress_wei->get_4bit_wei_ptr());
     float *scale = reinterpret_cast<float *>(compress_wei->get_scale_ptr());
-    buffer<float, 2> dst_buf(dequant_weight, range<2>(compress_wei->_K, compress_wei->_N));
+    buffer<DST_T, 2> dst_buf(dequant_weight, range<2>(compress_wei->_K, compress_wei->_N));
     buffer<float, 1> scale_buf(scale, range<1>(compress_wei->_K / compress_wei->_blksize * compress_wei->_N));
     buffer<int8_t, 2> src_buf(reinterpret_cast<int8_t *>(bit4_wei), range<2>(compress_wei->_K, compress_wei->_N / 2));
     constexpr int KTILE = 1024, NTILE = 1024;
@@ -344,7 +345,8 @@ void gpu_dequant(queue &q, CompressWei4Bit *compress_wei, float *dequant_weight,
 }
 
 // device mem impl
-void gpu_dequant(queue &q, int8_t *src, float *dst, float *scale, int k, int n, int blksize)
+template <typename DST_T>
+void gpu_dequant(queue &q, int8_t *src, DST_T *dst, float *scale, int k, int n, int blksize)
 {
     constexpr int KTILE = 1024, NTILE = 1024;
     constexpr int LOCAL_K = 32, LOCAL_N = 32;
@@ -363,7 +365,8 @@ void gpu_dequant(queue &q, int8_t *src, float *dst, float *scale, int k, int n, 
     return;
 }
 
-void dump_matrix(float *mat, int k, int n)
+template <typename DST_T>
+void dump_matrix(DST_T *mat, int k, int n)
 {
     for (int i = 0; i < k; i++)
     {
@@ -385,6 +388,7 @@ void ut(int K, int N, int blksize)
         f32wei[i] = randn() * 10;
     void *s4_wei = quantize(f32wei.data(), K, N, blksize, false, "s4fullrange_scalef32", "fp32");
     std::vector<float> gpu_dq(K * N);
+    std::vector<__fp16> fp16_gpu_dq(K * N);
     std::vector<float> cpu_dq(K * N);
     queue q;
 
@@ -395,6 +399,7 @@ void ut(int K, int N, int blksize)
     int8_t *dev_src = malloc_device<int8_t>(K * N / 2, q);
     float *dev_scale = malloc_device<float>(K / blksize * N, q);
     float *dev_dst = malloc_device<float>(K * N, q);
+    __fp16 *fp16_dev_dst = malloc_device<__fp16>(K * N, q);
 
     q.submit([&](handler &h)
              { h.memcpy(dev_src, obj.get_4bit_wei_ptr(), K * N / 2); });
@@ -404,15 +409,18 @@ void ut(int K, int N, int blksize)
 
     // gpu_dequant(q, &obj, gpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
     gpu_dequant(q, dev_src, dev_dst, dev_scale, K, N, blksize);
+    gpu_dequant(q, dev_src, fp16_dev_dst, dev_scale, K, N, blksize);
 
     q.submit([&](handler &h)
              { h.memcpy(gpu_dq.data(), dev_dst, K * N * sizeof(float)); });
+    q.submit([&](handler &h)
+             { h.memcpy(fp16_gpu_dq.data(), fp16_dev_dst, K * N * sizeof(__fp16)); });
     q.wait();
 
     bool ok = true;
     for (int i = 0; i < cpu_dq.size(); i++)
     {
-        if (cpu_dq[i] != gpu_dq[i])
+        if (cpu_dq[i] != gpu_dq[i] || abs(cpu_dq[i] - fp16_gpu_dq[i]) > 0.1)
             ok = false;
     }
     if (ok)
@@ -421,6 +429,10 @@ void ut(int K, int N, int blksize)
         std::cout << "fail" << std::endl;
 
     free(s4_wei);
+    free(dev_src, q);
+    free(dev_scale, q);
+    free(dev_dst, q);
+    free(fp16_dev_dst, q);
 }
 
 int main()
