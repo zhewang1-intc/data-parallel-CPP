@@ -1,7 +1,9 @@
 #include <sycl/ext/intel/esimd.hpp>
+// #include <sycl/ext/oneapi/experimental/invoke_simd.hpp>
 #include <sycl/sycl.hpp>
 using namespace sycl;
 using namespace sycl::ext::intel::esimd;
+// using namespace sycl::ext::oneapi::experimental;
 
 #include <assert.h>
 #include <math.h>
@@ -282,12 +284,6 @@ void gpu_dequant_s4fullrange_f32_KxN(queue &q, buffer<int8_t, 2> &src,
     }); });
 }
 
-// simd<int8_t, VL> int8_part2 = (int4x2_vec & mask) << 4;
-// simd<int8_t, 2 * VL> int8_vec;
-// int8_vec.template select<VL, 2>(0) = int8_part1;
-// int8_vec.template select<VL, 2>(1) = int8_part2;
-// simd<T_dst, 2 * VL> dst = int8_vec * scale[i];
-
 template <int TILE_K, int TILE_N, int LOCAK_K, int LOCAL_N, typename DST_T>
 void esimd_gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, DST_T *dst,
                                            float *scale, int k, int n, int blksize,
@@ -297,18 +293,20 @@ void esimd_gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, DST_T *dst,
            {
   range global{TILE_K, TILE_N};
   range local{LOCAK_K, LOCAL_N};
+  // auto slm=local_accessor<float,2>({16,16},h);
   h.parallel_for(nd_range{global, local},
                  [=](nd_item<2> it) [[intel::sycl_explicit_simd]] {
-int bit4_j=it.get_global_id(1)*32;
-int i=it.get_global_id(0);
-int dq_j=it.get_global_id(1)*64;
-if(dq_j+64<=n&&i<=k){
-// sycl::ext::oneapi::experimental::printf("i: %d,bit4_j: %d,dq_j: %d\n", i, bit4_j,dq_j);
+  
+  slm_init<16*16>();
+int bit4_j=it.get_global_id(1)*32+n_pos/2;
+int i=it.get_global_id(0)+k_pos;
+int dq_j=2*bit4_j;
+if(dq_j+64<=n&&i<k){
+  slm_allocator<16> test;
+simd<int8_t,16>ttt=  slm_block_load<int8_t,16>(test.get_offset());
 int8_t* wg_src=src+i*n/2+bit4_j;
 float* wg_scale1=scale+i/blksize*n+dq_j;
 float* wg_scale2=scale+i/blksize*n+dq_j+32;
-// unsigned short mask_arr[32]={1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0};
-// simd<unsigned short,32> mask1=block_load<unsigned short,32>(mask_arr);
 auto bit4_vec=block_load<int8_t,32>(wg_src);
 auto bit4_vec_cp=block_load<int8_t,32>(wg_src);
 auto scale_vec1=block_load<float,32>(wg_scale1);
@@ -325,7 +323,6 @@ ret_1.select<16,2>(0)=vec_fp32.select<16,1>(0);
 ret_1.select<16,2>(1)=vec_fp32_cp.select<16,1>(0);
 ret_2.select<16,2>(0)=vec_fp32.select<16,1>(16);
 ret_2.select<16,2>(1)=vec_fp32_cp.select<16,1>(16);
-// ret_1.merge(vec_fp32,vec_fp32_cp,mask1);
 
 ret_1=ret_1*scale_vec1;
 ret_2=ret_2*scale_vec2;
@@ -336,7 +333,7 @@ float* dst_ptr2=dst+i*n+dq_j+32;
 
 block_store<float,32>(dst_ptr1,ret_1);
 block_store<float,32>(dst_ptr2,ret_2);
-// if(bit4_j==0&&i==0){
+// if(dq_j<1024&&i==1){
 // for(int k=0;k<32;k++){
 //   sycl::ext::oneapi::experimental::printf("%f ", scale_vec1[k]);  
 //   }
@@ -455,7 +452,9 @@ void gpu_dequant(queue &q, int8_t *src, DST_T *dst, float *scale, int k, int n,
   {
     for (int j = 0; j < n; j += NTILE)
     {
-      esimd_gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(
+      // gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 2, LOCAL_K, LOCAL_N>(
+      //     q, src, dst, scale, k, n, blksize, i, j);
+      esimd_gpu_dequant_s4fullrange_f32_KxN<KTILE, NTILE / 64, LOCAL_K, LOCAL_N>(
           q, src, dst, scale, k, n, blksize, i, j);
     }
   }
@@ -499,10 +498,10 @@ void ut(int K, int N, int blksize)
 
   dequantize(&obj, cpu_dq.data(), false, "fp32", "s4fullrange_scalef32");
   // dump_matrix(cpu_dq.data(), K, N);
-  int8_t *dev_src = aligned_alloc_device<int8_t>(64,K * N / 2, q);
-  float *dev_scale = aligned_alloc_device<float>(64,K / blksize * N, q);
-  float *dev_dst = aligned_alloc_device<float>(64,K * N, q);
-  __fp16 *fp16_dev_dst = aligned_alloc_device<__fp16>(64,K * N, q);
+  int8_t *dev_src = aligned_alloc_device<int8_t>(64, K * N / 2, q);
+  float *dev_scale = aligned_alloc_device<float>(64, K / blksize * N, q);
+  float *dev_dst = aligned_alloc_device<float>(64, K * N, q);
+  __fp16 *fp16_dev_dst = aligned_alloc_device<__fp16>(64, K * N, q);
 
   q.submit([&](handler &h)
            { h.memcpy(dev_src, obj.get_4bit_wei_ptr(), K * N / 2); });
@@ -563,7 +562,11 @@ void ut(int K, int N, int blksize)
     // if (cpu_dq[i] != gpu_dq[i] || abs(cpu_dq[i] - fp16_gpu_dq[i]) > 0.1)
     // if (abs(cpu_dq[i] - fp16_gpu_dq[i]) > 0.1)
     if (cpu_dq[i] != gpu_dq[i])
+    {
+      std::cout<<"wrong idx: "<<i<<" "<<cpu_dq[i]<<"vs"<<gpu_dq[i]<<std::endl;
       ok = false;
+      // break;
+    }
   }
   if (ok)
     std::cout << "ok" << std::endl;
@@ -579,7 +582,12 @@ void ut(int K, int N, int blksize)
 
 int main()
 {
-  ut(1024, 1024, 8);
+
+  device dev = default_selector{}.select_device();
+  size_t local_mem_size = dev.get_info<info::device::local_mem_size>();
+  std::cout << "The device has " << local_mem_size << " bytes of local memory\n";
+
+  ut(1024, 4096, 32);
   ut(1020, 1024, 30);
   ut(11008, 4096, 32);
 
