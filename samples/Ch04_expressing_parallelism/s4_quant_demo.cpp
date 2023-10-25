@@ -1,5 +1,5 @@
 #include <sycl/ext/intel/esimd.hpp>
-// #include <sycl/ext/oneapi/experimental/invoke_simd.hpp>
+#include <sycl/ext/oneapi/experimental/invoke_simd.hpp>
 #include <sycl/sycl.hpp>
 using namespace sycl;
 using namespace sycl::ext::intel::esimd;
@@ -284,6 +284,16 @@ void gpu_dequant_s4fullrange_f32_KxN(queue &q, buffer<int8_t, 2> &src,
     }); });
 }
 
+// [[intel::device_indirectly_callable]] SYCL_EXTERNAL void __regcall invoke_sub_dq(simd<int8_t, 16> slm_vec) SYCL_ESIMD_FUNCTION {}
+void  invoke_sub_dq(simd<int8_t, 16> slm_vec,int dq_j,int i)  {
+if(dq_j<1024&&i==1){
+// for(int k=0;k<32;k++){
+//   sycl::ext::oneapi::experimental::printf("%f ", scale_vec1[k]);  
+//   }
+  sycl::ext::oneapi::experimental::printf("dq_j:%d\n",dq_j);  
+}
+}
+
 template <int TILE_K, int TILE_N, int LOCAK_K, int LOCAL_N, typename DST_T>
 void esimd_gpu_dequant_s4fullrange_f32_KxN(queue &q, int8_t *src, DST_T *dst,
                                            float *scale, int k, int n, int blksize,
@@ -329,16 +339,12 @@ ret_2=ret_2*scale_vec2;
 float* dst_ptr1=dst+i*n+dq_j;
 float* dst_ptr2=dst+i*n+dq_j+32;
 
-
+// sycl::sub_group sg=it.get_sub_group();
+// invoke_simd(sg,invoke_sub_dq,ttt);
 
 block_store<float,32>(dst_ptr1,ret_1);
 block_store<float,32>(dst_ptr2,ret_2);
-// if(dq_j<1024&&i==1){
-// for(int k=0;k<32;k++){
-//   sycl::ext::oneapi::experimental::printf("%f ", scale_vec1[k]);  
-//   }
-//   sycl::ext::oneapi::experimental::printf("\n");  
-// }
+invoke_sub_dq(ttt,dq_j,i);
 }
                  }); });
 }
@@ -563,7 +569,7 @@ void ut(int K, int N, int blksize)
     // if (abs(cpu_dq[i] - fp16_gpu_dq[i]) > 0.1)
     if (cpu_dq[i] != gpu_dq[i])
     {
-      std::cout<<"wrong idx: "<<i<<" "<<cpu_dq[i]<<"vs"<<gpu_dq[i]<<std::endl;
+      std::cout << "wrong idx: " << i << " " << cpu_dq[i] << "vs" << gpu_dq[i] << std::endl;
       ok = false;
       // break;
     }
