@@ -21,3 +21,8 @@ add_book_sample(
     TEST
     TARGET fig_4_15_nd_range_matrix_multiply
     SOURCES fig_4_15_nd_range_matrix_multiply.cpp)
+
+add_book_sample(
+    TEST
+    TARGET act_shuf
+    SOURCES act_shuf.cpp)
