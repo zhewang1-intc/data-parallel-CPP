@@ -18,37 +18,40 @@ void shuf_ref(int m, int k, int *idx, std::vector<T> &act) {
       act[i * k + j] = act_bk[i * k + idx[j]];
 }
 
-template <typename T, int ACT_BK_SLM, int SHUF_SLM>
-void shuf_tar(queue &q, T *act, int *idx, int m, int k) {
-  assert(ACT_BK_SLM >= k);
+template <typename T> void shuf_tar(queue &q, T *act, int *idx, int m, int k) {
   q.submit([&](handler &h) {
-    // sycl::stream str(8192, 1024, h);
-    sycl::local_accessor<T> act_bk_slm{ACT_BK_SLM, h};
-    sycl::local_accessor<T> act_shuf_slm{SHUF_SLM, h};
-    auto split_k_factor = (k + SHUF_SLM - 1) / SHUF_SLM;
-    assert(k % split_k_factor == 0);
-    h.parallel_for(
-        nd_range(sycl::range<2>(m, k), sycl::range<2>(1, k / split_k_factor)),
-        [=](nd_item<2> it) [[intel::reqd_sub_group_size(16)]] {
-          int i = it.get_global_id(0);
-          int j = it.get_global_id(1);
-          auto split_idx = j % (k / split_k_factor);
-          auto sg = it.get_sub_group();
-          // cpy raw act to act_bk_slm & shuf_idx to shuf_idx_slm
-          // for utilize simd lane.
-          for (int ii = 0; ii < split_k_factor; ii++) {
-            act_bk_slm[split_idx + ii * sg.get_local_range()[0]] =
-                act[i * k + split_idx + ii * sg.get_local_range()[0]];
-          }
-          it.barrier();
-          act[i * k + j] = act_bk_slm[j];
-          auto shuf_idx = idx[j];
-          // shuffle activation
-          act_shuf_slm[split_idx] = act_bk_slm[shuf_idx];
-          it.barrier();
-          // write back
-          act[i * k + j] = act_shuf_slm[split_idx];
-        });
+    sycl::local_accessor<T> act_shuf_slm{256, h};
+    unsigned int *sync_ptr = malloc_shared<unsigned int>(1, q);
+    *sync_ptr = 0;
+    int dim_2 = 1024;
+    int dim_1 = (m * k + 1023) / 1024;
+    dim_1 = dim_1 > 1024 ? 1024 : dim_1;
+    int dim_0 = dim_1 == 1024 ? (m * k + 1024 * 1024 - 1) / (1024 * 1024) : 1;
+    // std::cout << dim_0 << " " << dim_1 << " " << dim_2 << std::endl;
+    // sycl::stream str(8192, 8192, h);
+    h.parallel_for(nd_range(sycl::range<3>(dim_0, dim_1, dim_2),
+                            sycl::range<3>(1, 1, 256)),
+                   [=](nd_item<3> it) [[intel::reqd_sub_group_size(32)]] {
+                     auto linear_idx = it.get_global_linear_id();
+                     if (linear_idx < m * k) {
+                       auto k_offset = linear_idx % k;
+                       auto m_offset = linear_idx / k;
+                       auto shuf_idx = idx[k_offset];
+                       auto local_idx = it.get_local_linear_id();
+                       act_shuf_slm[local_idx] = act[m_offset * k + shuf_idx];
+                       if (local_idx == 0) {
+                         atomic_ref<unsigned int, memory_order::acq_rel,
+                                    memory_scope::device,
+                                    access::address_space::global_space>
+                             sync_atomic(*sync_ptr);
+                         sync_atomic++;
+                         while (sync_atomic < m * k / 256)
+                           ;
+                       }
+                       it.barrier(access::fence_space::global_and_local);
+                       act[linear_idx] = act_shuf_slm[local_idx];
+                     }
+                   });
   });
 }
 
@@ -73,20 +76,26 @@ template <typename T> void ut(int m, int k) {
     h.memcpy(idx_device, shuf_idx.data(), k * sizeof(int));
   });
   q.wait();
-  shuf_ref(m, k, shuf_idx.data(), act_ref);
 
-  int warm_up = 100;
+  int warm_up = 1000;
   for (int i = 0; i < warm_up; i++) {
-    shuf_tar<T, 1024, 1024>(q, act_device_warm_up, idx_device_warm_up, m, k);
+    shuf_tar<T>(q, act_device_warm_up, idx_device_warm_up, m, k);
     q.wait();
   }
 
   using namespace std::chrono;
 
   auto m_start = high_resolution_clock::now();
-  shuf_tar<T, 1024, 1024>(q, act_device, idx_device, m, k);
+  shuf_ref(m, k, shuf_idx.data(), act_ref);
   auto m_end = high_resolution_clock::now();
-  std::cout << "device cost"
+  std::cout << "CPU cost"
+            << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms"
+            << std::endl;
+  m_start = high_resolution_clock::now();
+  shuf_tar<T>(q, act_device, idx_device, m, k);
+  q.wait();
+  m_end = high_resolution_clock::now();
+  std::cout << "GPU cost"
             << duration_cast<nanoseconds>(m_end - m_start).count() / 1e6 << "ms"
             << std::endl;
   q.submit([&](handler &h) {
@@ -95,7 +104,8 @@ template <typename T> void ut(int m, int k) {
   q.wait();
 
   // for (int i = 0; i < act_tar.size(); i++) {
-  //   std::cout << act_tar[i] << "vs" << act_ref[i] << std::endl;
+  //   // std::cout << act_tar[i] << "vs" << act_ref[i] << std::endl;
+  //   std::cout << act_tar[i] - act_ref[i] << std::endl;
   // }
 
   // if (std::all_of(act_tar.begin(), act_tar.end(), [](T i) { return i == 0;
@@ -145,11 +155,22 @@ void dump_device_info() {
                  q.get_device()
                      .get_info<sycl::info::device::global_mem_cache_size>())
       << std::endl;
+  std::cout
+      << "max work-group size: "
+      << std::to_string(
+             q.get_device().get_info<sycl::info::device::max_work_group_size>())
+      << std::endl;
+  std::cout
+      << "max sub-group size: "
+      << std::to_string(
+             q.get_device().get_info<sycl::info::device::max_num_sub_groups>())
+      << std::endl;
   // bank: 16
 }
 
 int main() {
-  dump_device_info();
-  ut<half>(1024, 1024);
-  //   ut<__fp16>(1, 11008);
+  // dump_device_info();
+  // ut<half>(32, 4096);
+  ut<half>(1, 11008);
+  // ut<half>(6, 11008);
 }
