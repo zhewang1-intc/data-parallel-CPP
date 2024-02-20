@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstring>
 #include <math.h>
+#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/sycl.hpp>
 #include <vector>
 using namespace sycl;
@@ -117,6 +118,34 @@ template <typename T> void ut(int m, int k) {
   }
 }
 
+template <typename T>
+void gather_ut(int input_elt_num = 32, int gather_elt_num = 8) {
+  sycl::queue q;
+  T *input_vec = malloc_shared<T>(input_elt_num, q);
+  uint32_t *gather_offset = malloc_shared<uint32_t>(gather_elt_num, q);
+  assert(input_elt_num % gather_elt_num == 0);
+  auto gather_stride = input_elt_num / gather_elt_num;
+  for (int i = 0; i < input_elt_num; i++)
+    input_vec[i] = i;
+  for (int i = 0; i < gather_elt_num; i++)
+    gather_offset[i] = i * gather_stride * sizeof(T);
+
+  q.submit([&](handler &h) {
+    h.parallel_for(
+        nd_range(sycl::range<1>(input_elt_num / 32),
+                 sycl::range<1>(input_elt_num / 32)),
+        [=](nd_item<1> it) [[intel::sycl_explicit_simd]] {
+          auto esimd_gather =
+              sycl::ext::intel::esimd::block_load<uint32_t, 8>(gather_offset);
+          auto esimd_vec =
+              sycl::ext::intel::esimd::gather<T, 8>(input_vec, esimd_gather);
+          sycl::ext::intel::esimd::block_store(input_vec, esimd_vec);
+        });
+  });
+  q.wait();
+  for (int i = 0; i < input_elt_num; i++)
+    std::cout << input_vec[i] << std::endl;
+}
 void dump_device_info() {
   auto d_selector = sycl::default_selector_v;
   sycl::queue q;
@@ -171,6 +200,7 @@ void dump_device_info() {
 int main() {
   // dump_device_info();
   // ut<half>(32, 4096);
-  ut<half>(1, 11008);
+  // ut<half>(1, 11008);
+  gather_ut<half>();
   // ut<half>(6, 11008);
 }
